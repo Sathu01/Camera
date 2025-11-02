@@ -3,15 +3,26 @@ services:
     image: bluenviron/mediamtx:latest
     container_name: mediamtx
     ports:
-      - "8554:8554"   # RTSP
-      - "8888:8888"   # Web UI / HLS/metrics (as per config)
-      - "9997:9997"   # API
-      - "9998:9998"   # metrics
-      # Uncomment if you also need RTMP
-      # - "1935:1935"
+      - "8554:8554"     # RTSP
+      - "8555:8555"     # RTSPS
+      - "9997:9997"     # API
+      - "9998:9998"     # Metrics
     volumes:
-      - ./Docker/mediamtx.yml:/mediamtx.yml:ro
+      - ./mediamtx.yml:/mediamtx.yml
+      - ./recordings:/recordings
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 3G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    environment:
+      - MTX_PROTOCOLS=tcp
+    # 👇 ไม่ต้องใช้ network custom แล้ว
+    network_mode: bridge
 
   backendcam:
     container_name: backendcam
@@ -24,10 +35,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      RTSP_HOST: mediamtx
+      RTSP_HOST: 127.0.0.1
     volumes:
-      # Mount local HLS assets into the container to match hls.server.path=/hls
       - ./hls:/hls
     restart: unless-stopped
-
-    # If you don't need to rebuild every time, you can comment `build:` and rely on the image tag instead.
+    # 👇 ใช้ host network เพื่อให้เข้าถึง 127.0.0.1:8554 ได้
+    network_mode: host
