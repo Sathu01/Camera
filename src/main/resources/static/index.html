@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <title>Camera Admin (Firestore)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="config.js"></script>
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+  <!-- jQuery -->
+  <script src="https://code.jquery.com/jquery-3.6.4.min.js"></script>
+  <!-- Firebase compat (ทำให้โค้ดสั้นและใช้แนว v8 ได้) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+  <style>
+    body { padding-bottom: 80px; }
+    .table-actions { white-space: nowrap; }
+  </style>
+</head>
+<body class="bg-light">
+  <nav class="navbar navbar-expand-lg bg-white border-bottom">
+    <div class="container-fluid">
+      <span class="navbar-brand fw-semibold">Camera Admin</span>
+      <div class="ms-auto">
+        <button id="btnReload" class="btn btn-outline-secondary btn-sm">Reload</button>
+        <button id="btnAdd" class="btn btn-primary btn-sm ms-2">+ เพิ่มรายการ</button>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container py-4">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <div class="d-flex align-items-center mb-3">
+          <h5 class="card-title mb-0">รายการกล้อง (collection: <code>cameras</code>)</h5>
+          <div class="ms-auto small text-muted mx-1" id="statusText">กำลังเชื่อมต่อ...</div>
+
+          <!-- เพิ่มปุ่ม -->
+          <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" hidden />
+          <button id="btnImport" class="btn btn-outline-primary btn-sm">Import</button>
+          <button id="btnTemplate" class="btn btn-outline-secondary btn-sm ms-2">Download Template</button>
+        </div>
+
+        <div class="table-responsive">
+          <table class="table table-hover align-middle" id="tblCameras">
+            <thead class="table-light">
+              <tr>
+                <th style="width: 20%">ชื่อ</th>
+                <th style="width: 18%">พิกัด (lat_long)</th>
+                <th style="width: 27%">ที่อยู่ (address)</th>
+                <th style="width: 20%">URL (RTSP)</th>
+                <th style="width: 15%"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <!-- rows injected here -->
+            </tbody>
+          </table>
+        </div>
+
+        <div id="emptyState" class="text-center text-muted py-4 d-none">
+          <div>ยังไม่มีข้อมูล</div>
+          <button class="btn btn-sm btn-primary mt-2" id="btnAdd2">+ เพิ่มรายการแรก</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Modal: Add/Edit -->
+  <div class="modal fade" id="editModal" tabindex="-1" aria-labelledby="editModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+      <form id="cameraForm" class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="editModalLabel">เพิ่ม/แก้ไข กล้อง</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="ปิด"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="docId" />
+          <div class="mb-3">
+            <label class="form-label">ชื่อ (name) <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="name" required />
+          </div>
+          <div class="mb-3">
+            <label class="form-label">พิกัด (lat_long) <span class="text-muted">(เช่น 19.9367,99.8325)</span></label>
+            <input type="text" class="form-control" id="lat_long" placeholder="ละติจูด,ลองจิจูด" />
+          </div>
+          <div class="mb-3">
+            <label class="form-label">ที่อยู่ (address)</label>
+            <input type="text" class="form-control" id="address" />
+          </div>
+          <div class="mb-0">
+            <label class="form-label">URL</label>
+            <input type="text" class="form-control" id="URL" placeholder="เช่น rtsp:// หรือ http(s)://" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">ยกเลิก</button>
+          <button type="submit" class="btn btn-primary" id="btnSave">บันทึก</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal Preview -->
+  <div class="modal fade" id="previewModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">ตรวจสอบข้อมูลก่อนนำเข้า</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <table class="table table-bordered table-sm" id="previewTable"></table>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">ยกเลิก</button>
+          <button type="button" class="btn btn-primary" id="confirmImport">ยืนยันนำเข้า</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bootstrap JS (modal) -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+  <script>
+
+    firebase.initializeApp(window.firebaseConfig);
+    const db = firebase.firestore();
+    const col = db.collection('cameras');
+
+    // UI refs
+    const $tbody = $('#tblCameras tbody');
+    const statusText = document.getElementById('statusText');
+    const editModal = new bootstrap.Modal('#editModal');
+    const previewModal = new bootstrap.Modal('#previewModal');
+    let importData = [];  // เก็บข้อมูลที่อ่านจากไฟล์ไว้ใช้ตอนกดยืนยัน
+    const form = document.getElementById('cameraForm');
+
+    // Render row
+    function rowTemplate(id, data) {
+      const name = data.name || '';
+      let latlong = '';
+      let mapsLink = '';
+      if (data.lat_long) {
+        // 🔹 Firestore GeoPoint
+        if (typeof data.lat_long.latitude === 'number' && typeof data.lat_long.longitude === 'number') {
+          const lat = data.lat_long.latitude.toFixed(5);
+          const lng = data.lat_long.longitude.toFixed(5);
+          latlong = `${lat}, ${lng}`;
+          mapsLink = `https://www.google.com/maps?q=${lat},${lng}`;
+        }
+        // 🔹 ถ้าเป็น string (เก็บมาแล้ว)
+        else if (typeof data.lat_long === 'string' && data.lat_long.includes(',')) {
+          latlong = data.lat_long;
+          const parts = data.lat_long.split(',');
+          mapsLink = `https://www.google.com/maps?q=${parts[0].trim()},${parts[1].trim()}`;
+        }
+      }
+
+      const address = data.address || '';
+      const url = data.URL || data.url || '';
+
+      return `
+        <tr data-id="${id}">
+          <td class="fw-semibold">${escapeHtml(name)}</td>
+          <td><code>${escapeHtml(latlong)}</code>
+            ${latlong ? `
+              <a href="${mapsLink}" target="_blank" class="btn btn-sm btn-outline-primary ms-2" title="เปิดแผนที่">
+                <i class="bi bi-geo-alt"></i>
+              </a>` : ''}
+          </td>
+          <td>
+            <div class="d-flex align-items-center justify-content-between">
+              <span class="flex-grow-1">${escapeHtml(address)}</span>
+            </div>
+          </td>
+          <td style="max-width:220px; white-space:normal; word-wrap:break-word;">
+            ${url ? `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a>` : ''}
+          </td>
+          <td class="table-actions text-end">
+            <button class="btn btn-sm btn-outline-secondary me-1 btn-edit">แก้ไข</button>
+            <button class="btn btn-sm btn-outline-danger btn-del">ลบ</button>
+          </td>
+        </tr>`;
+    }
+
+    // แปลง GeoPoint หรือ string → string "lat,lng"
+    function formatLatLngForInput(val) {
+      if (!val) return '';
+      if (typeof val === 'string') return val.trim();
+      if (typeof val.latitude === 'number' && typeof val.longitude === 'number') {
+        return `${val.latitude},${val.longitude}`;
+      }
+      return '';
+    }
+
+    // แปลง string → { geoPoint | null }  (คืน null ถ้าไม่ valid/ว่าง)
+    function parseLatLngFromInput(s) {
+      if (!s) return null;
+      const txt = String(s).trim().replace(/\s+/g, '');
+      const m = txt.match(/^(-?\d+(\.\d+)?),(-?\d+(\.\d+)?)$/);
+      if (!m) return null;
+      const lat = parseFloat(m[1]);
+      const lng = parseFloat(m[3]);
+      if (Number.isNaN(lat) || Number.isNaN(lng)) return null;
+      return new firebase.firestore.GeoPoint(lat, lng);
+    }
+
+    // Escape helpers (กัน XSS ง่ายๆ)
+    function escapeHtml(s) {
+      if (typeof s !== 'string') s = String(s || '');
+      return s.replace(/[&<>"']/g, m => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[m]));
+    }
+
+    function escapeAttr(s) {
+      if (typeof s !== 'string') s = String(s || '');
+      return s.replace(/"/g, '&quot;');
+    }
+
+    // Load (Realtime)
+    let unsubscribe = null;
+    function attachRealtime() {
+      if (unsubscribe) unsubscribe();
+      statusText.textContent = 'กำลังโหลด...';
+      unsubscribe = col.orderBy('name', 'asc').onSnapshot(snap => {
+        $tbody.empty();
+        if (snap.empty) {
+          $('#emptyState').removeClass('d-none');
+        } else {
+          $('#emptyState').addClass('d-none');
+          snap.forEach(doc => $tbody.append(rowTemplate(doc.id, doc.data())));
+        }
+        statusText.textContent = 'เชื่อมต่อเรียบร้อย';
+      }, err => {
+        console.error(err);
+        statusText.textContent = 'เกิดข้อผิดพลาดในการเชื่อมต่อ';
+      });
+    }
+
+    $('#btnImport').on('click', () => {
+      $('#fileInput').val('');    // รีเซ็ต เพื่อให้เลือกไฟล์เดิมได้อีก
+      $('#fileInput')[0].click(); // เปิด dialog
+    });
+
+    $('#fileInput').on('change', handleImport);
+
+    // 2.  ใช้ XLSX.read() อ่านไฟล์ -> แปลงเป็น array
+    function handleImport(e){
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function(evt){
+        const wb = XLSX.read(evt.target.result, { type: 'binary' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        let rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false }); // array of arrays
+
+        if (rows.length) rows = rows.slice(1);
+
+        // แปลงเป็นอ็อบเจกต์ตามลำดับคอลัมน์ 1..4 => name, lat_long, address, url
+        const data = rows
+          .map(r => ({
+            name: (r[0] || '').toString().trim(),
+            lat_long: (r[1] || '').toString().trim(),
+            address: (r[2] || '').toString().trim(),
+            url: (r[3] || '').toString().trim()
+          }))
+          // ข้ามแถวว่างจริง ๆ (ไม่มี name และช่องอื่นก็ว่าง)
+          .filter(d => d.name || d.lat_long || d.address || d.url);
+
+        previewInModal(data);
+      };
+      reader.readAsBinaryString(file);
+    }
+
+    // 3. แสดงใน modal preview (bootstrap table)
+    function previewInModal(data){
+      importData = data; // เก็บไว้ใช้ตอน confirm
+
+      // วาดหัวตาราง + แถวตัวอย่าง (name, lat_long, address, url)
+      const $tbl = $('#previewTable');
+      const head = `
+        <thead class="table-light">
+          <tr>
+            <th style="width:25%">ชื่อ (name)</th>
+            <th style="width:20%">พิกัด (lat,long)</th>
+            <th style="width:35%">ที่อยู่ (address)</th>
+            <th style="width:20%">URL</th>
+          </tr>
+        </thead>`;
+      const body = `
+        <tbody>
+          ${data.map(r => `
+            <tr>
+              <td>${escapeHtml(r.name || '')}</td>
+              <td><code>${escapeHtml(r.lat_long || '')}</code></td>
+              <td>${escapeHtml(r.address || '')}</td>
+              <td style="max-width:260px; white-space:normal; word-wrap:break-word;">
+                ${r.url ? `<a href="${escapeAttr(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.url)}</a>` : ''}
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>`;
+
+      $tbl.html(head + body);
+
+      // เปิด modal (Bootstrap 5)
+      previewModal.show();
+    }
+
+    // 4. เมื่อกด Confirm -> add() เข้า Firestore
+    $('#confirmImport').on('click', async () => {
+      if (!importData.length) { previewModal.hide(); return; }
+
+      try {
+        for (const d of importData) {
+          const geo = parseLatLngFromInput(d.lat_long);
+          await col.add({
+            name: (d.name || '').trim(),
+            address: (d.address || '').trim(),
+            url: (d.url || '').trim(),
+            ...(geo ? { lat_long: geo } : {})
+          });
+        }
+        previewModal.hide();
+      } catch (err) {
+        console.error(err);
+        alert('นำเข้าไม่สำเร็จ');
+      }
+    });
+
+    $('#btnTemplate').on('click', ()=>{
+      const ws = XLSX.utils.aoa_to_sheet([['ชื่อ (name)', 'พิกัด (lat,long)', 'ที่อยู่ (address)', 'URL']]);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Template');
+      const wbout = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+      saveAs(new Blob([wbout], {type:'application/octet-stream'}), 'cameras_template.xlsx');
+    });
+
+    // Add
+    function openAddModal() {
+      $('#editModalLabel').text('เพิ่มกล้อง');
+      $('#docId').val('');
+      $('#name,#lat_long,#address,#URL').val('');
+      editModal.show();
+    }
+
+    // Edit
+    function openEditModal(id) {
+      col.doc(id).get().then(d => {
+        if (!d.exists) return;
+        const data = d.data() || {};
+        $('#editModalLabel').text('แก้ไขกล้อง');
+        $('#docId').val(id);
+        $('#name').val(data.name || '');
+        // 🔹 แสดง lat_long เป็น "lat,lng" เสมอ
+        $('#lat_long').val(formatLatLngForInput(data.lat_long));
+        $('#address').val(data.address || '');
+        // 🔹 รองรับทั้ง URL และ url แต่แสดงเป็นช่องเดียว
+        $('#URL').val(data.URL || data.url || '');
+        editModal.show();
+      });
+    }
+
+    // Save (create/update)
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const id = $('#docId').val().trim();
+      const name = $('#name').val().trim();
+      const latStr = $('#lat_long').val().trim();
+      const address = $('#address').val().trim();
+      const urlInput = $('#URL').val().trim(); // 🔹 รับมาจากช่องเดียว
+
+      if (!name) {
+        alert('กรุณาใส่ชื่อ (name)');
+        return;
+      }
+
+      // 🔹 แปลง lat_long string → GeoPoint (ถ้า valid)
+      const geo = parseLatLngFromInput(latStr);
+
+      // 🔹 payload: normalize ใช้ฟิลด์ 'url' (ตัวเล็ก) เสมอ
+      const payload = {
+        name,
+        address,
+        url: urlInput
+      };
+
+      // จัดการ lat_long: set เป็น GeoPoint ถ้า valid, ถ้าเว้นว่าง → ลบฟิลด์
+      if (geo) {
+        payload.lat_long = geo;
+      } else {
+        payload.lat_long = firebase.firestore.FieldValue.delete();
+      }
+
+      try {
+        if (id) {
+          await col.doc(id).set(payload, { merge: true });
+        } else {
+          await col.add(payload);
+        }
+        editModal.hide();
+      } catch (err) {
+        console.error(err);
+        alert('บันทึกไม่สำเร็จ');
+      }
+    });
+
+    // Delete
+    function deleteDoc(id) {
+      if (!confirm('ยืนยันลบรายการนี้?')) return;
+      col.doc(id).delete().catch(err => {
+        console.error(err);
+        alert('ลบไม่สำเร็จ');
+      });
+    }
+
+    // Events
+    $('#btnAdd, #btnAdd2').on('click', openAddModal);
+    $('#btnReload').on('click', attachRealtime);
+
+    // Delegate table actions
+    $tbody.on('click', '.btn-edit', function() {
+      const id = $(this).closest('tr').data('id');
+      openEditModal(id);
+    });
+    $tbody.on('click', '.btn-del', function() {
+      const id = $(this).closest('tr').data('id');
+      deleteDoc(id);
+    });
+
+    // Init
+    attachRealtime();
+  </script>
+</body>
+</html>
