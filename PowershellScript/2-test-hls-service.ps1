@@ -1,11 +1,11 @@
-param(
-    [int]$StreamCount = 75,
-    [string]$ApiBaseUrl = "http://localhost:8080",
-    [string]$RtspUrl = "rtsp://127.0.0.1:8554/v1"
-)
+# Simple 80 Stream Test Script
+$StreamCount = 20
+$ApiBaseUrl = "http://localhost:8080"
+$RtspUrl = "rtsp://127.0.0.1:8554/v1"
+$BatchSize = 25
 
 Write-Host "========================================"
-Write-Host "$StreamCount Stream Concurrent Test"
+Write-Host "Starting $StreamCount Streams Test"
 Write-Host "========================================"
 
 $results = @{
@@ -14,12 +14,13 @@ $results = @{
     Errors  = @()
 }
 
-$batchSize  = 25
-$batchCount = [Math]::Ceiling($StreamCount / $batchSize)
+$batchCount = [Math]::Ceiling($StreamCount / $BatchSize)
 
 for ($batch = 0; $batch -lt $batchCount; $batch++) {
-    $start = ($batch * $batchSize) + 1
-    $end   = [Math]::Min((($batch + 1) * $batchSize), $StreamCount)
+    $start = ($batch * $BatchSize) + 1
+    $end   = [Math]::Min((($batch + 1) * $BatchSize), $StreamCount)
+    
+    Write-Host "`nBatch $($batch + 1)/$batchCount : Streams $start-$end"
 
     $jobs = @()
     for ($i = $start; $i -le $end; $i++) {
@@ -38,9 +39,9 @@ for ($batch = 0; $batch -lt $batchCount; $batch++) {
                     -Method POST `
                     -ContentType "application/json" `
                     -Body $body `
-                    -TimeoutSec 10
+                    -TimeoutSec 15
 
-                return @{ Success = $true; Name = $name; Response = $response }
+                return @{ Success = $true; Name = $name }
             }
             catch {
                 return @{ Success = $false; Name = $name; Error = $_.Exception.Message }
@@ -56,19 +57,32 @@ for ($batch = 0; $batch -lt $batchCount; $batch++) {
         $result = Receive-Job -Job $job
         if ($result.Success) {
             $results.Started++
-            Write-Host "V $($result.Name)"
+            Write-Host "  V $($result.Name)" -ForegroundColor Green
         } else {
             $results.Failed++
             $results.Errors += "$($result.Name): $($result.Error)"
-            Write-Host "X $($result.Name): $($result.Error)"
+            Write-Host "  X $($result.Name): $($result.Error)" -ForegroundColor Red
         }
     }
 
     $jobs | Remove-Job -Force
+    
+    if ($batch -lt $batchCount - 1) {
+        Write-Host "  Waiting 2 seconds..."
+        Start-Sleep -Seconds 2
+    }
 }
 
-Write-Host "========================================"
+Write-Host "`n========================================"
 Write-Host "FINAL RESULTS"
 Write-Host "========================================"
-Write-Host "Started: $($results.Started)"
-Write-Host "Failed: $($results.Failed)"
+Write-Host "Started: $($results.Started)" -ForegroundColor Green
+Write-Host "Failed: $($results.Failed)" -ForegroundColor Red
+
+if ($results.Errors.Count -gt 0) {
+    Write-Host "`nErrors:"
+    $results.Errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+}
+
+
+Write-Host "`nTest Complete!"
