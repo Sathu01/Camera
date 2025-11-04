@@ -67,6 +67,16 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-web</artifactId>
 		</dependency>
+		<dependency>
+			<groupId>org.bytedeco</groupId>
+			<artifactId>ffmpeg-platform-gpl</artifactId>
+			<version>6.0-1.5.9</version>
+		</dependency>
+		<dependency>
+			<groupId>org.bytedeco</groupId>
+			<artifactId>cuda-platform</artifactId>
+			<version>12.3-8.9-1.5.10</version>
+		</dependency>
 	</dependencies>
 
 
@@ -75,6 +85,15 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				 <configuration>
+                    <jvmArguments>
+                        -Xmx4G 
+                        -Xms4G 
+                        -XX:MaxMetaspaceSize=512M 
+                        -XX:+UseG1GC 
+                        -XX:MaxGCPauseMillis=200
+                    </jvmArguments>
+                </configuration>
 			</plugin>
 		</plugins>
 	</build>
