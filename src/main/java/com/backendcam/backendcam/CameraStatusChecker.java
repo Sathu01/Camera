@@ -19,9 +19,7 @@ public class CameraStatusChecker {
      * @return true = online, false = offline
      */
     public boolean isCameraOnline(String rtspUrl) {
-        FFmpegFrameGrabber grabber = null;
-        try {
-            grabber = new FFmpegFrameGrabber(rtspUrl);
+        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(rtspUrl)) {
             grabber.setOption("rtsp_transport", "tcp");
             grabber.setOption("stimeout", "5000000"); // 5 วินาที
             grabber.start(); // จะ throw exception ถ้า connect ไม่ได้
@@ -32,10 +30,6 @@ public class CameraStatusChecker {
         } catch (Exception e) {
             logger.warn("Camera offline: {} ({})", rtspUrl, e.getMessage());
             return false;
-        } finally {
-            try {
-                if (grabber != null) grabber.stop();
-            } catch (Exception ignore) {}
         }
     }
 
