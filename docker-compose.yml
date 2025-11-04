@@ -21,7 +21,6 @@ services:
           memory: 2G
     environment:
       - MTX_PROTOCOLS=tcp
-    # 👇 ไม่ต้องใช้ network custom แล้ว
     network_mode: bridge
 
   backendcam:
@@ -39,5 +38,4 @@ services:
     volumes:
       - ./hls:/hls
     restart: unless-stopped
-    # 👇 ใช้ host network เพื่อให้เข้าถึง 127.0.0.1:8554 ได้
     network_mode: host

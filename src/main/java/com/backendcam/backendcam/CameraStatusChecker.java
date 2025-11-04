@@ -1,8 +1,11 @@
-package com.example.camerastatus;
+package com.backendcam.backendcam;
+
+import java.util.concurrent.CompletableFuture;
 
 import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -34,5 +37,11 @@ public class CameraStatusChecker {
                 if (grabber != null) grabber.stop();
             } catch (Exception ignore) {}
         }
+    }
+
+    @Async
+    public CompletableFuture<Boolean> isCameraOnlineAsync(String url) {
+        boolean result = isCameraOnline(url);
+        return CompletableFuture.completedFuture(result);
     }
 }
