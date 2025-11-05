@@ -1,0 +1,87 @@
+# MediaMTX Configuration - Optimized for 100+ Concurrent Streams
+# Place this file as mediamtx.yml in your MediaMTX directory
+
+# General Settings
+logLevel: info
+logDestinations: [stdout]
+logFile: mediamtx.log
+
+# API Settings
+api: yes
+apiAddress: :9997
+
+# Metrics
+metrics: yes
+metricsAddress: :9998
+
+# Performance Tuning
+readTimeout: 20s
+writeTimeout: 20s
+readBufferCount: 2048
+writeQueueSize: 1024
+
+# RTSP Server Settings
+rtspDisable: no
+protocols: [tcp, udp]
+encryption: "no"
+rtspAddress: :8554
+rtspsAddress: :8555
+rtpAddress: :8000
+rtcpAddress: :8001
+multicastIPRange: 224.1.0.0/16
+multicastRTPPort: 8002
+multicastRTCPPort: 8003
+
+# UDP/RTP Settings
+udpMaxPayloadSize: 1472
+
+# Path Defaults - Applied to all streams
+pathDefaults:
+  # Source Settings
+  source: publisher
+  sourceProtocol: automatic
+  sourceAnyPortEnable: no
+  
+  # Recording (disabled for performance)
+  record: no
+  
+  # Performance Settings
+  # disablePublisherOverride: no
+  fallback: ""
+  
+  # Publisher settings
+  publishUser: ""
+  publishPass: ""
+  publishIPs: []
+  
+  # Reader settings  
+  readUser: ""
+  readPass: ""
+  readIPs: []
+  
+  # RTSP-specific
+  sourceOnDemand: no
+  sourceOnDemandStartTimeout: 10s
+  sourceOnDemandCloseAfter: 10s
+  
+  # Redirect
+  sourceRedirect: ""
+  
+  # Override with publisher
+  overridePublisher: yes
+  
+  # Run on init/demand
+  runOnInit: ""
+  runOnInitRestart: no
+  runOnDemand: ""
+  runOnDemandRestart: no
+  runOnDemandStartTimeout: 10s
+  runOnDemandCloseAfter: 10s
+  runOnReady: ""
+  runOnNotReady: ""
+  runOnRead: ""
+  runOnUnread: ""
+
+paths:
+  all:
+    source: publisher

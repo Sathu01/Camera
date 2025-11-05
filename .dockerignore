@@ -1,0 +1,29 @@
+# Exclude folders and files that should not be sent to the Docker build context
+
+# Explicitly exclude the project's Docker assets folder (user request)
+Docker/
+docker/
+
+# Large/irrelevant runtime media
+hls/
+
+# Local scripts and artifacts not needed for image build
+PowershellScript/
+target/
+
+# VCS and IDE
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Logs and temp
+**/*.log
+**/*.csv
+**/*.tmp
+**/*.ts
+**/*.m3u8
+
+# OS files
+Thumbs.db
+Desktop.ini
