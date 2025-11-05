@@ -1,0 +1,33 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    ports:
+      - "8554:8554"   # RTSP
+      - "8888:8888"   # Web UI / HLS/metrics (as per config)
+      - "9997:9997"   # API
+      - "9998:9998"   # metrics
+      # Uncomment if you also need RTMP
+      # - "1935:1935"
+    volumes:
+      - ./Docker/mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped
+
+  backendcam:
+    container_name: backendcam
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: backendcam:latest
+    depends_on:
+      - mediamtx
+    ports:
+      - "8080:8080"
+    environment:
+      RTSP_HOST: mediamtx
+    volumes:
+      # Mount local HLS assets into the container to match hls.server.path=/hls
+      - ./hls:/hls
+    restart: unless-stopped
+
+    # If you don't need to rebuild every time, you can comment `build:` and rely on the image tag instead.

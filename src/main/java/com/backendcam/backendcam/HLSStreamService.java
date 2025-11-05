@@ -28,9 +28,9 @@ public class HLSStreamService {
     // Configuration
     private static final String HLS_ROOT = "./hls";
     private static final int MAX_STREAMS = 100;
-    private static final int WORKER_THREADS = 25;
+    private static final int WORKER_THREADS = 50;
     private static final long STARTUP_DELAY_MS = 800;
-    private static final int TARGET_FPS = 6;
+    private static final int TARGET_FPS = 10; //6 fps 
     private static final long FRAME_INTERVAL_NS = 1_000_000_000L / TARGET_FPS;
     private static final int MAX_RECONNECT_ATTEMPTS = 3;
     private static final long RECONNECT_DELAY_MS = 5000;
@@ -293,9 +293,9 @@ public class HLSStreamService {
         // REFACTOR #1: STRICT thread control - prevent FFmpeg internal threading
         g.setOption("threads", "1");
         g.setOption("thread_type", "slice");
-        g.setOption("thread_count", "1");
+        g.setOption("thread_count", "0");
         g.setVideoOption("threads", "1");
-        g.setAudioOption("threads", "1");
+        //g.setAudioOption("threads", "1");
         
         // REFACTOR #2: Disable buffering to prevent background threads
         g.setOption("fflags", "nobuffer");
@@ -345,9 +345,10 @@ public class HLSStreamService {
         int targetWidth = width;
         int targetHeight = height;
         
-        if (height > 480) {
+        //production 480p
+        if (height > 720) {
             double aspectRatio = (double) width / height;
-            targetHeight = 480;
+            targetHeight = 720;
             targetWidth = (int) (targetHeight * aspectRatio);
             targetWidth = (targetWidth / 2) * 2;
             targetHeight = (targetHeight / 2) * 2;
