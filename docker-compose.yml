@@ -10,9 +10,12 @@ services:
     volumes:
       - ./mediamtx.yml:/mediamtx.yml
       - ./recordings:/recordings
+      - /usr/share/zoneinfo/Asia/Bangkok:/etc/localtime:ro
+      - /usr/share/zoneinfo/Asia/Bangkok:/etc/timezone:ro
     restart: unless-stopped
     environment:
       - MTX_PROTOCOLS=tcp
+      - TZ=Asia/Bangkok
     network_mode: bridge
 
   backendcam:
@@ -26,8 +29,13 @@ services:
     ports:
       - "8080:8080"
     environment:
-      RTSP_HOST: 127.0.0.1
+      RTSP_HOST: "127.0.0.1"
+      TZ: "Asia/Bangkok"
+      GOOGLE_APPLICATION_CREDENTIALS: "/secrets/serviceAccount.json"
     volumes:
       - ./hls:/hls
+      - ./secrets/serviceAccount.json:/secrets/serviceAccount.json:ro
+      - /usr/share/zoneinfo/Asia/Bangkok:/etc/localtime:ro
+      - /usr/share/zoneinfo/Asia/Bangkok:/etc/timezone:ro
     restart: unless-stopped
     network_mode: host

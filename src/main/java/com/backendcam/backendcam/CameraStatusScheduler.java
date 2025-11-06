@@ -1,45 +1,84 @@
 package com.backendcam.backendcam;
 
-import org.springframework.beans.factory.annotation.Autowired;
+import com.backendcam.backendcam.firestore.FirestoreService;
+import com.backendcam.backendcam.util.TimeAgoFormatter;
+import com.google.cloud.firestore.QueryDocumentSnapshot;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.time.Instant;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 @Component
 public class CameraStatusScheduler {
 
-  @Autowired
-  private CameraStatusChecker cameraStatusChecker;
+  private final CameraStatusChecker cameraStatusChecker;
+  private final FirestoreService firestoreService;
 
-  private final List<String> rtspUrls = new java.util.ArrayList<>();
-  {
-    for (int i = 1; i <= 16; i++) {
-      rtspUrls.add("rtsp://127.0.0.1:8554/cam" + i);
-    }
+  public CameraStatusScheduler(CameraStatusChecker checker, FirestoreService fsService) {
+    this.cameraStatusChecker = checker;
+    this.firestoreService = fsService;
   }
 
   // รันทุก 60 วินาที
-  @Scheduled(fixedRate = 60000)
+  @Scheduled(fixedRate = 60_000)
   public void checkCameras() {
-    List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+    long t0 = System.nanoTime();
 
-    for (String url : rtspUrls) {
-      futures.add(cameraStatusChecker.isCameraOnlineAsync(url));
+    List<QueryDocumentSnapshot> docs = firestoreService.fetchAllCameras();
+    if (docs.isEmpty()) {
+      System.out.println("[Cameras] Checked 0 docs in 0.000 s → online=0, offline=0");
+      return;
     }
 
-    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+    Map<String, String> idToUrl = new HashMap<>();
+    for (QueryDocumentSnapshot d : docs) {
+      String url = FirestoreService.pickRtspUrl(d.getData()).orElse(null);
+      idToUrl.put(d.getId(), url);
+    }
 
-    for (int i = 0; i < rtspUrls.size(); i++) {
+    // ทำงานขนานด้วย CompletableFuture (ใช้ @Async ภายใน checker)
+    Map<String, CompletableFuture<Boolean>> tasks = new LinkedHashMap<>();
+    idToUrl.forEach((docId, url) -> {
+      if (url == null || url.isBlank()) {
+        // ไม่มี URL → ถือว่า offline ทันที
+        tasks.put(docId, CompletableFuture.completedFuture(false));
+      } else {
+        tasks.put(docId, cameraStatusChecker.isCameraOnlineAsync(url));
+      }
+    });
+
+    // รอทุกงานเสร็จ
+    CompletableFuture.allOf(tasks.values().toArray(new CompletableFuture[0])).join();
+
+    int online = 0, offline = 0;
+
+    // อัปเดตผลลัพธ์กลับ Firestore ตามโจทย์
+    for (Map.Entry<String, CompletableFuture<Boolean>> e : tasks.entrySet()) {
+      String docId = e.getKey();
+      boolean ok = false;
       try {
-        boolean online = futures.get(i).get();
-        System.out.printf("%s -> %s%n", rtspUrls.get(i), online ? "ONLINE" : "OFFLINE");
-      } catch (Exception e) {
-        System.out.printf("%s -> ERROR%n", rtspUrls.get(i));
+        ok = e.getValue().get();
+      } catch (Exception ignore) {
+        ok = false;
+      }
+
+      if (ok) {
+        online++;
+        Instant now = Instant.now();
+        // online ตอนนี้ → message เป็น "just now"
+        String message = TimeAgoFormatter.humanizeSinceSeconds(0);
+        firestoreService.updateOnline(docId, message, now);
+      } else {
+        offline++;
+        // offline → ไม่แตะ lastSeen
+        firestoreService.updateOffline(docId);
       }
     }
+
+    long ms = (System.nanoTime() - t0) / 1_000_000L;
+    System.out.printf("[Cameras] Checked %d docs in %.3f s → online=%d, offline=%d%n",
+        docs.size(), ms / 1000.0, online, offline);
   }
 }
