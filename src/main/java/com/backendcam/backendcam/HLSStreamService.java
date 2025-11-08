@@ -16,7 +16,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.LockSupport;
 import java.util.logging.Logger;
 
 @Service
@@ -29,12 +28,11 @@ public class HLSStreamService {
     private static final int MAX_STREAMS = 100;
     private static final int WORKER_THREADS = 50;
     private static final long STARTUP_DELAY_MS = 800;
-    private static final int TARGET_FPS = 10; // 6 fps
-    private static final long FRAME_INTERVAL_NS = 1_000_000_000L / TARGET_FPS;
+    private static final int TARGET_FPS = 10;
     private static final int MAX_RECONNECT_ATTEMPTS = 3;
     private static final long RECONNECT_DELAY_MS = 5000;
 
-    // Thread pools - REFACTOR #3:commit SynchronousQueue for strict thread control
+    // Thread pools
     private final ExecutorService streamExecutor;
     private final ScheduledExecutorService startupScheduler;
 
@@ -50,16 +48,14 @@ public class HLSStreamService {
     private final ConcurrentHashMap<String, StreamStats> streamStats = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicBoolean> streamStopFlags = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> streamRtspUrls = new ConcurrentHashMap<>();
-    private String codec = null;
 
     public HLSStreamService() {
-        // REFACTOR #3: SynchronousQueue enforces fixed pool, no extra threads
         this.streamExecutor = new ThreadPoolExecutor(
                 WORKER_THREADS,
                 WORKER_THREADS,
                 0L,
                 TimeUnit.MILLISECONDS,
-                new SynchronousQueue<>(), // Changed from LinkedBlockingQueue
+                new SynchronousQueue<>(),
                 new ThreadFactory() {
                     private final AtomicInteger counter = new AtomicInteger(0);
 
@@ -85,11 +81,11 @@ public class HLSStreamService {
         avutil.av_log_set_level(avutil.AV_LOG_ERROR);
 
         logger.info("╔════════════════════════════════════════════╗");
-        logger.info("║  HLS Service - Ultra-Optimized CPU Mode  ║");
+        logger.info("║  HLS Service - HEVC Buffer Fix Mode      ║");
         logger.info("║  Max Streams: " + MAX_STREAMS + "                          ║");
         logger.info("║  Worker Threads: " + WORKER_THREADS + "                      ║");
         logger.info("║  Target FPS: " + TARGET_FPS + "                            ║");
-        logger.info("║  Thread Limit: ~" + (WORKER_THREADS * 3) + " expected              ║");
+        logger.info("║  Strategy: Read All, Encode Selected      ║");
         logger.info("╚════════════════════════════════════════════╝");
     }
 
@@ -153,7 +149,6 @@ public class HLSStreamService {
         return playlistPath;
     }
 
-    // REFACTOR #6: Auto-reconnect wrapper
     private void runStreamWithAutoReconnect(String rtspUrl, String streamName, StreamStats stats) {
         int reconnectAttempt = 0;
         AtomicBoolean stopFlag = streamStopFlags.get(streamName);
@@ -170,13 +165,11 @@ public class HLSStreamService {
 
                 runStream(rtspUrl, streamName, stats);
 
-                // Stream ended normally
                 if (stopFlag.get()) {
                     logger.info("✓ Stream stopped by user: " + streamName);
                     break;
                 }
 
-                // Unexpected stop - reconnect
                 logger.warning("⚠ Stream ended unexpectedly: " + streamName);
                 reconnectAttempt++;
 
@@ -221,20 +214,29 @@ public class HLSStreamService {
             String hlsOutput = outputDir.getAbsolutePath() + "/stream.m3u8";
 
             grabber = connectRtspWithRetry(rtspUrl, streamName);
+            
+            // Get camera's actual frame rate
+            double sourceFrameRate = grabber.getFrameRate();
+            if (sourceFrameRate <= 0 || sourceFrameRate > 60) {
+                sourceFrameRate = 25; // Default fallback
+            }
+            
             int width = grabber.getImageWidth();
             int height = grabber.getImageHeight();
-            codec = grabber.getVideoCodecName();
+            String codec = grabber.getVideoCodecName();
 
             if (width <= 0 || height <= 0) {
                 throw new RuntimeException("Invalid resolution: " + width + "x" + height);
             }
 
             stats.setResolution(width, height);
-            logger.info("✓ RTSP connected: " + streamName + " (" + width + "x" + height + ")");
+            stats.setSourceCodec(codec);
+            stats.setSourceFps(sourceFrameRate);
+            logger.info("✓ RTSP connected: " + streamName + " (" + width + "x" + height + 
+                       ", codec: " + codec + ", source FPS: " + sourceFrameRate + ")");
 
             recorder = createRecorder(hlsOutput, outputDir, width, height);
 
-            // Small delay for stability
             Thread.sleep(200);
 
             recorder.start();
@@ -245,12 +247,16 @@ public class HLSStreamService {
             StreamResources resources = new StreamResources(grabber, recorder);
             streamResources.put(streamName, resources);
 
-            // Log active threads
             ThreadPoolExecutor executor = (ThreadPoolExecutor) streamExecutor;
             logger.info("📊 Active threads: " + executor.getActiveCount() + "/" + WORKER_THREADS +
                     " | Total system threads: " + Thread.activeCount());
 
-            streamFrames(grabber, recorder, streamName, stats);
+            // CRITICAL: Calculate frame skip ratio based on source FPS
+            int frameSkipRatio = Math.max(1, (int) Math.round(sourceFrameRate / TARGET_FPS));
+            logger.info("🎯 Frame strategy: Read ALL frames, encode every " + frameSkipRatio + 
+                       "th frame (" + sourceFrameRate + " fps → " + TARGET_FPS + " fps)");
+
+            streamFrames(grabber, recorder, streamName, stats, frameSkipRatio);
 
         } finally {
             safeCleanup(streamName, grabber, recorder, recorderStarted);
@@ -269,6 +275,7 @@ public class HLSStreamService {
 
                     Frame testFrame = grabber.grabImage();
                     if (testFrame != null && testFrame.image != null) {
+                        logger.info("✓ Connected to: " + url);
                         return grabber;
                     }
 
@@ -292,17 +299,18 @@ public class HLSStreamService {
         g.setFormat("rtsp");
         g.setImageMode(org.bytedeco.javacv.FrameGrabber.ImageMode.COLOR);
 
-        // REFACTOR #1: STRICT thread control - prevent FFmpeg internal threading
+        // Thread control
         g.setOption("threads", "1");
-        g.setOption("thread_type", "slice"); // มาดูใหม่ทีหลัง
         g.setOption("thread_count", "0");
         g.setVideoOption("threads", "1");
-        // g.setAudioOption("threads", "1");
 
-        // REFACTOR #2: Disable buffering to prevent background threads
-        g.setOption("fflags", "nobuffer");
+        // CRITICAL: HEVC error tolerance - allow corrupt frames
+        g.setOption("err_detect", "ignore_err");
+        g.setOption("ec", "favor_inter+guess_mvs+deblock");
+
+        // CRITICAL: Remove nobuffer to prevent buffer overflow!
+        g.setOption("fflags", "discardcorrupt");  // Removed "nobuffer"
         g.setOption("flags", "low_delay");
-        g.setOption("avioflags", "direct");
 
         // RTSP settings
         g.setOption("rtsp_transport", "tcp");
@@ -310,19 +318,18 @@ public class HLSStreamService {
         g.setOption("stimeout", "10000000");
         g.setOption("timeout", "1000000");
 
-        // Performance
-        g.setOption("analyzeduration", "3000000");
-        g.setOption("probesize", "3000000");
-        g.setOption("max_delay", "0");
+        // HEVC-friendly buffer sizes
+        g.setOption("analyzeduration", "2000000");  // Reduced for lower latency
+        g.setOption("probesize", "2000000");
+        g.setOption("max_delay", "500000");
         g.setOption("allowed_media_types", "video");
 
-        // Error handling
-        g.setOption("err_detect", "ignore_err");
-        g.setOption("skip_frame", "noref");
-        g.setOption("ec", "guess_mvs+deblock");
+        // HEVC error tolerance
+        g.setOption("max_error_rate", "0.9");  // Increased tolerance
 
+        // Timestamp handling
         g.setOption("use_wallclock_as_timestamps", "1");
-        g.setOption("fflags", "+igndts");
+        g.setOption("fflags", "+genpts");
 
         return g;
     }
@@ -351,7 +358,6 @@ public class HLSStreamService {
         int targetWidth = width;
         int targetHeight = height;
 
-        // production 480p
         if (height > 720) {
             double aspectRatio = (double) width / height;
             targetHeight = 720;
@@ -361,17 +367,9 @@ public class HLSStreamService {
         }
 
         FFmpegFrameRecorder recorder = new FFmpegFrameRecorder(hlsOutput, targetWidth, targetHeight, 0);
-        if ("h264".equalsIgnoreCase(codec)) {
-            recorder.setVideoCodecName("copy");
-            recorder.setOption("hls_time", "3");
-            recorder.setOption("hls_list_size", "2");
-            recorder.setOption("hls_flags", "delete_segments");
-            recorder.setOption("hls_segment_filename", outputDir.getAbsolutePath() + "/s%d.ts");
-            logger.info("⚡ Copy mode (H.264) enabled for: " + outputDir.getName());
-            return recorder;
-        }
         recorder.setVideoCodec(avcodec.AV_CODEC_ID_H264);
         recorder.setFormat("hls");
+
         recorder.setFrameRate(TARGET_FPS);
         recorder.setGopSize(TARGET_FPS * 2);
 
@@ -385,33 +383,28 @@ public class HLSStreamService {
         String segPath = outputDir.getAbsolutePath().replace('\\', '/') + "/s%d.ts";
         recorder.setOption("hls_segment_filename", segPath);
 
-        // REFACTOR #1: STRICT single-threaded encoding
+        // Single-threaded encoding
         recorder.setOption("threads", "1");
         recorder.setVideoOption("threads", "1");
-        recorder.setOption("thread_type", "slice");
-        recorder.setVideoOption("slice_threading", "0");
-        recorder.setVideoOption("frame_threading", "0");
-        recorder.setVideoOption("tile_columns", "0");
 
-        // Aggressive CPU-friendly settings
-        recorder.setOption("preset", "ultrafast");
+        // CPU-friendly settings
+        recorder.setOption("preset", "veryfast");
         recorder.setOption("tune", "zerolatency");
-        recorder.setOption("crf", "38");
-        recorder.setOption("maxrate", "280k");
-        recorder.setOption("bufsize", "560k");
+        recorder.setOption("crf", "24");
+        recorder.setOption("maxrate", "1000k");
+        recorder.setOption("bufsize", "1500k");
 
         // Minimize CPU work
         recorder.setOption("sc_threshold", "0");
         recorder.setOption("g", String.valueOf(TARGET_FPS * 2));
         recorder.setOption("keyint_min", String.valueOf(TARGET_FPS));
-        recorder.setOption("refs", "1");
-        recorder.setOption("bf", "0");
+        recorder.setOption("refs", "2");
+        recorder.setOption("bf", "1");
         recorder.setOption("me_method", "dia");
         recorder.setOption("subq", "0");
         recorder.setOption("trellis", "0");
         recorder.setOption("cabac", "0");
         recorder.setOption("fast-pskip", "1");
-        recorder.setOption("no-dct-decimate", "1");
         recorder.setOption("flags", "+low_delay");
         recorder.setOption("fflags", "+genpts");
         recorder.setOption("fps_mode", "cfr");
@@ -419,16 +412,23 @@ public class HLSStreamService {
         return recorder;
     }
 
-    private void streamFrames(FFmpegFrameGrabber grabber, FFmpegFrameRecorder recorder, String streamName,
-            StreamStats stats) throws Exception {
+    /**
+     * CRITICAL FIX: Read ALL frames continuously to prevent buffer overflow,
+     * but only encode selected frames based on skip ratio.
+     * This prevents the HEVC "Could not find ref with POC" errors.
+     */
+    private void streamFrames(FFmpegFrameGrabber grabber, FFmpegFrameRecorder recorder, 
+                              String streamName, StreamStats stats, int frameSkipRatio) throws Exception {
         Frame frame;
         long lastLogTime = System.currentTimeMillis();
         long lastStatsUpdate = System.currentTimeMillis();
 
-        final int MAX_CONSECUTIVE_ERRORS = 20;
+        final int MAX_CONSECUTIVE_ERRORS = 30;  // Increased tolerance
+        final int MAX_NULL_FRAMES = 100;         // Increased tolerance
         int consecutiveErrors = 0;
+        int consecutiveNullFrames = 0;
+        int frameCounter = 0;
 
-        long nextFrameTimeNs = System.nanoTime();
         AtomicBoolean stopFlag = streamStopFlags.get(streamName);
 
         while (!isShuttingDown.get() &&
@@ -436,36 +436,33 @@ public class HLSStreamService {
                 !stopFlag.get()) {
 
             try {
+                // CRITICAL: ALWAYS read the next frame immediately
+                // Don't wait or sleep before grabbing - keep the buffer flowing!
                 frame = grabber.grabImage();
 
                 if (frame == null) {
-                    // REFACTOR #5: LockSupport instead of Thread.sleep
-                    LockSupport.parkNanos(50_000_000); // 50ms
-                    frame = grabber.grabImage();
-                    if (frame == null) {
-                        logger.info("📡 Stream ended: " + streamName);
+                    consecutiveNullFrames++;
+
+                    if (consecutiveNullFrames < MAX_NULL_FRAMES) {
+                        Thread.sleep(5); // Very short wait for null frames
+                        continue;
+                    } else {
+                        logger.warning(streamName + ": Stream ended (too many null frames)");
                         break;
                     }
                 }
 
-                long nowNs = System.nanoTime();
+                consecutiveNullFrames = 0;
+                stats.recordReadFrame();
+                frameCounter++;
 
-                if (nowNs < nextFrameTimeNs) {
-                    stats.recordSkippedFrame();
-                    long sleepNs = nextFrameTimeNs - nowNs;
-                    if (sleepNs > 5_000_000) {
-                        // REFACTOR #5: LockSupport.parkNanos() for better performance
-                        LockSupport.parkNanos(sleepNs);
-                    }
-                    continue;
-                }
+                // Decide if we should ENCODE this frame
+                boolean shouldEncode = (frameCounter % frameSkipRatio == 0);
 
-                // REFACTOR #6: Better error handling around record
-                if (frame.image != null) {
+                if (shouldEncode && frame.image != null) {
                     try {
                         recorder.record(frame);
                         stats.recordEncodedFrame();
-                        nextFrameTimeNs = nowNs + FRAME_INTERVAL_NS;
                         consecutiveErrors = 0;
 
                     } catch (Exception e) {
@@ -473,15 +470,16 @@ public class HLSStreamService {
                         consecutiveErrors++;
 
                         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                            logger.warning(streamName + ": Too many encode errors, restarting stream");
-                            throw new RuntimeException("Too many encode errors (" + consecutiveErrors + ")");
+                            logger.warning(streamName + ": Too many encode errors (" + consecutiveErrors + ")");
+                            throw new RuntimeException("Too many encode errors: " + consecutiveErrors);
                         }
-
-                        nextFrameTimeNs = nowNs + FRAME_INTERVAL_NS;
                         continue;
                     }
+                } else {
+                    stats.recordSkippedFrame();
                 }
 
+                // Logging
                 long now = System.currentTimeMillis();
                 if (now - lastLogTime > 10000) {
                     logger.info(stats.getLogSummary());
@@ -498,17 +496,23 @@ public class HLSStreamService {
                 consecutiveErrors++;
 
                 String msg = e.getMessage();
-                if (msg != null && (msg.contains("error while decoding") ||
+
+                // HEVC errors are expected - be tolerant
+                if (msg != null && (
+                        msg.contains("Could not find ref") ||
+                        msg.contains("error while decoding") ||
                         msg.contains("corrupted") ||
-                        msg.contains("cbp too large"))) {
+                        msg.contains("cbp too large") ||
+                        msg.contains("POC") ||
+                        msg.contains("Invalid NAL"))) {
 
-                    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                        throw new RuntimeException("Too many decode errors");
+                    if (consecutiveErrors < MAX_CONSECUTIVE_ERRORS) {
+                        // Continue reading frames - don't let buffer fill up!
+                        continue;
+                    } else {
+                        logger.warning(streamName + ": Too many HEVC errors, reconnecting");
+                        throw new RuntimeException("Too many HEVC errors: " + consecutiveErrors);
                     }
-
-                    // REFACTOR #5: LockSupport instead of Thread.sleep
-                    LockSupport.parkNanos(10_000_000); // 10ms
-                    continue;
                 }
 
                 throw e;
@@ -519,13 +523,11 @@ public class HLSStreamService {
     public void stopHLSStream(String streamName) {
         logger.info("■ Stopping: " + streamName);
 
-        // Set stop flag
         AtomicBoolean stopFlag = streamStopFlags.get(streamName);
         if (stopFlag != null) {
             stopFlag.set(true);
         }
 
-        // Cancel the task
         Future<?> future = streamTasks.remove(streamName);
         if (future != null && !future.isDone()) {
             future.cancel(true);
@@ -560,7 +562,6 @@ public class HLSStreamService {
         deleteStreamFiles(streamName);
     }
 
-    // REFACTOR #4: Removed System.gc() calls
     private void safeCleanup(String streamName, FFmpegFrameGrabber grabber, FFmpegFrameRecorder recorder,
             boolean recorderWasStarted) {
         streamResources.remove(streamName);
@@ -592,8 +593,6 @@ public class HLSStreamService {
                 // Ignore
             }
         }
-
-        // REFACTOR #4: No explicit System.gc() - let JVM handle it
     }
 
     private void deleteStreamFiles(String streamName) {
@@ -652,7 +651,6 @@ public class HLSStreamService {
 
         isShuttingDown.set(true);
 
-        // Set all stop flags
         streamStopFlags.values().forEach(flag -> flag.set(true));
 
         startupScheduler.shutdown();
@@ -706,16 +704,18 @@ public class HLSStreamService {
         }
     }
 
-    // REFACTOR #7: LongAdder for better concurrent performance
     public static class StreamStats {
         private final String streamName;
         private final long startTime;
-        private final LongAdder totalFrames = new LongAdder();
+        private final LongAdder totalReadFrames = new LongAdder();
+        private final LongAdder totalEncodedFrames = new LongAdder();
         private final LongAdder skippedFrames = new LongAdder();
         private final LongAdder errors = new LongAdder();
         private final AtomicInteger startAttempts = new AtomicInteger(0);
         private volatile String encoder = "unknown";
+        private volatile String sourceCodec = "unknown";
         private volatile String resolution = "unknown";
+        private volatile double sourceFps = 0.0;
         private volatile double currentFps = 0.0;
         private volatile long lastFrameCount = 0;
         private volatile long lastFpsUpdate = System.currentTimeMillis();
@@ -725,8 +725,12 @@ public class HLSStreamService {
             this.startTime = System.currentTimeMillis();
         }
 
+        public void recordReadFrame() {
+            totalReadFrames.increment();
+        }
+
         public void recordEncodedFrame() {
-            totalFrames.increment();
+            totalEncodedFrames.increment();
         }
 
         public void recordSkippedFrame() {
@@ -745,6 +749,14 @@ public class HLSStreamService {
             this.encoder = encoder;
         }
 
+        public void setSourceCodec(String codec) {
+            this.sourceCodec = codec;
+        }
+
+        public void setSourceFps(double fps) {
+            this.sourceFps = fps;
+        }
+
         public void setResolution(int width, int height) {
             this.resolution = width + "x" + height;
         }
@@ -753,7 +765,7 @@ public class HLSStreamService {
             long now = System.currentTimeMillis();
             long elapsed = now - lastFpsUpdate;
             if (elapsed > 0) {
-                long current = totalFrames.sum();
+                long current = totalEncodedFrames.sum();
                 long framesSinceLastUpdate = current - lastFrameCount;
                 currentFps = (framesSinceLastUpdate * 1000.0) / elapsed;
                 lastFrameCount = current;
@@ -763,18 +775,27 @@ public class HLSStreamService {
 
         public String getLogSummary() {
             long uptime = (System.currentTimeMillis() - startTime) / 1000;
-            return String.format("%s | %s | %s | %d frames (%.1f fps) | skip: %d | err: %d | uptime: %ds",
-                    streamName, encoder, resolution, totalFrames.sum(), currentFps,
-                    skippedFrames.sum(), errors.sum(), uptime);
+            long read = totalReadFrames.sum();
+            long encoded = totalEncodedFrames.sum();
+            long skipped = skippedFrames.sum();
+            double readRate = uptime > 0 ? read / (double) uptime : 0;
+            
+            return String.format(
+                "%s | %s(%.0ffps)→%s | %s | read: %d (%.1f/s) | encoded: %d (%.1f fps) | skip: %d | err: %d | uptime: %ds",
+                streamName, sourceCodec, sourceFps, encoder, resolution, read, readRate, 
+                encoded, currentFps, skipped, errors.sum(), uptime);
         }
 
         public String getFinalSummary() {
             long totalTime = (System.currentTimeMillis() - startTime) / 1000;
-            long total = totalFrames.sum();
-            double avgFps = totalTime > 0 ? total / (double) totalTime : 0;
+            long read = totalReadFrames.sum();
+            long encoded = totalEncodedFrames.sum();
+            double avgReadFps = totalTime > 0 ? read / (double) totalTime : 0;
+            double avgEncodedFps = totalTime > 0 ? encoded / (double) totalTime : 0;
             return String.format(
-                    "%s | Total: %d frames in %ds (%.1f fps avg) | Encoder: %s | Errors: %d | Attempts: %d",
-                    streamName, total, totalTime, avgFps, encoder, errors.sum(), startAttempts.get());
+                    "%s | %s(%.0ffps)→%s | Read: %d frames (%.1f fps avg) | Encoded: %d frames (%.1f fps avg) | Errors: %d | Attempts: %d",
+                    streamName, sourceCodec, sourceFps, encoder, read, avgReadFps, encoded, avgEncodedFps, 
+                    errors.sum(), startAttempts.get());
         }
 
         // Getters
@@ -782,8 +803,12 @@ public class HLSStreamService {
             return streamName;
         }
 
-        public int getTotalFrames() {
-            return totalFrames.intValue();
+        public int getTotalReadFrames() {
+            return totalReadFrames.intValue();
+        }
+
+        public int getTotalEncodedFrames() {
+            return totalEncodedFrames.intValue();
         }
 
         public int getSkippedFrames() {
@@ -798,12 +823,20 @@ public class HLSStreamService {
             return encoder;
         }
 
+        public String getSourceCodec() {
+            return sourceCodec;
+        }
+
         public String getResolution() {
             return resolution;
         }
 
         public double getCurrentFps() {
             return currentFps;
+        }
+
+        public double getSourceFps() {
+            return sourceFps;
         }
 
         public long getUptimeSeconds() {
