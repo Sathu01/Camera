@@ -48,8 +48,13 @@ public class CameraStatusScheduler {
       }
     });
 
-    // รอทุกงานเสร็จ
-    CompletableFuture.allOf(tasks.values().toArray(new CompletableFuture[0])).join();
+    // รอทุกงานเสร็จ (หรือ timeout ภายใน 10 วินาที)
+    try {
+      CompletableFuture.allOf(tasks.values().toArray(new CompletableFuture[0]))
+        .get(10, java.util.concurrent.TimeUnit.SECONDS);
+    } catch (Exception e) {
+      System.out.println("[Cameras] Some checks timed out: " + e.getMessage());
+    }
 
     int online = 0, offline = 0;
 
