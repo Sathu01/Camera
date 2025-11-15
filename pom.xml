@@ -96,58 +96,53 @@
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-maven-plugin</artifactId>
     <configuration>
-        <jvmArguments>
-            <!-- Heap Memory: 4GB fixed (prevents resizing overhead) -->
-            -Xms4G
-            -Xmx4G
-            
-            <!-- Metaspace: For class metadata -->
-            -XX:MetaspaceSize=256M
-            -XX:MaxMetaspaceSize=512M
-            
-            <!-- G1GC: Best for large heaps with predictable pauses -->
-            -XX:+UseG1GC
-            -XX:MaxGCPauseMillis=200
-            -XX:G1HeapRegionSize=16M
-            -XX:InitiatingHeapOccupancyPercent=45
-            -XX:G1ReservePercent=10
-            
-            <!-- GC Logging: Critical for debugging memory issues -->
-            -Xlog:gc*:file=/var/log/gc.log:time,uptime,level,tags:filecount=5,filesize=50M
-            
-            <!-- Native Memory Tracking: Monitor off-heap memory (FFmpeg) -->
-            -XX:NativeMemoryTracking=summary
-            
-            <!-- Heap Dump on OOM: Capture state when crash occurs -->
-            -XX:+HeapDumpOnOutOfMemoryError
-            -XX:HeapDumpPath=/var/log/heapdump.hprof
-            -XX:OnOutOfMemoryError="kill -9 %p"
-            
-            <!-- Performance Optimizations -->
-            -XX:+UseStringDeduplication
-            -XX:+ParallelRefProcEnabled
-            -XX:+UnlockExperimentalVMOptions
-            -XX:G1NewSizePercent=30
-            -XX:G1MaxNewSizePercent=40
-            
-            <!-- Direct Memory: For FFmpeg native buffers -->
-            -XX:MaxDirectMemorySize=2G
-            
-            <!-- Thread Stack Size: Reduce per-thread overhead -->
-            -Xss512k
-            
-            <!-- Aggressive cleanup of unused memory -->
-            -XX:+ExplicitGCInvokesConcurrent
-            -XX:+UseStringCache
-            
-            <!-- JIT Compiler Optimizations -->
-            -XX:+TieredCompilation
-            -XX:TieredStopAtLevel=1
-            
-            <!-- Reduce lock contention for multi-threaded streams -->
-            -XX:+UseBiasedLocking
-            -XX:BiasedLockingStartupDelay=0
-        </jvmArguments>
+                <jvmArguments>
+                    <!-- Heap Memory: 4GB fixed (prevents resizing overhead) -->
+                    -Xms4G
+                    -Xmx4G
+                    
+                    <!-- Metaspace: For class metadata -->
+                    -XX:MetaspaceSize=256M
+                    -XX:MaxMetaspaceSize=512M
+                    
+                    <!-- G1GC: Best for large heaps with predictable pauses -->
+                    -XX:+UseG1GC
+                    -XX:MaxGCPauseMillis=200
+                    -XX:G1HeapRegionSize=16M
+                    -XX:InitiatingHeapOccupancyPercent=45
+                    -XX:G1ReservePercent=10
+                    
+                    <!-- GC Logging: Use relative path with write permissions -->
+                    -Xlog:gc*:file=./logs/gc.log:time,uptime,level,tags:filecount=5,filesize=50M 
+                    
+                    <!-- Native Memory Tracking: Monitor off-heap memory (FFmpeg) -->
+                    -XX:NativeMemoryTracking=summary
+                    
+                    <!-- Heap Dump on OOM: Use relative path -->
+                    -XX:+HeapDumpOnOutOfMemoryError
+                    -XX:HeapDumpPath=./logs/heapdump.hprof
+                    -XX:OnOutOfMemoryError="kill -9 %p"
+                    
+                    <!-- Performance Optimizations -->
+                    -XX:+UseStringDeduplication
+                    -XX:+ParallelRefProcEnabled
+                    -XX:+UnlockExperimentalVMOptions
+                    -XX:G1NewSizePercent=30
+                    -XX:G1MaxNewSizePercent=40
+                    
+                    <!-- Direct Memory: For FFmpeg native buffers -->
+                    -XX:MaxDirectMemorySize=2G
+                    
+                    <!-- Thread Stack Size: Reduce per-thread overhead -->
+                    -Xss512k
+                    
+                    <!-- Aggressive cleanup of unused memory -->
+                    -XX:+ExplicitGCInvokesConcurrent
+                    
+                    <!-- JIT Compiler Optimizations -->
+                    -XX:+TieredCompilation
+                    -XX:TieredStopAtLevel=1
+                </jvmArguments>
     </configuration>
 </plugin>
 		</plugins>
