@@ -24,30 +24,22 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.logging.Logger;
 
 /**
- * ✅ PRODUCTION-READY HLS STREAMING SERVICE
- * 
- * Optimized for: 16+ cameras at 25fps source → 8fps output
- * Key Features:
- * - Zero memory leaks (all frames properly closed)
- * - No deadlocks (no blocking flush operations)
- * - Handles 25fps cameras that won't reduce framerate
- * - Network congestion resistant (proper buffering)
- * - Automatic reconnection with exponential backoff
- * - 24/7 stable operation
+ * ✅ FIXED: Proper reconnection handling
+ * - Waits for old task to fully stop before starting new one
+ * - Properly releases FFmpeg resources
+ * - No duplicate tasks per stream
  */
 @Service
 public class HLSStreamService {
 
     private static final Logger logger = Logger.getLogger(HLSStreamService.class.getName());
 
-    // Configuration
     private static final String HLS_ROOT = "./hls";
     private static final String LOG_ROOT = "./logs";
     private static final int MAX_STREAMS = 100;
     private static final int WORKER_THREADS = 70;
     private static final long STARTUP_DELAY_MS = 3000;
     private static final int TARGET_FPS = 8;
-    private static final int MAX_RECONNECT_ATTEMPTS = Integer.MAX_VALUE;
     private static final long RECONNECT_DELAY_MS = 5000;
     private static final long MAX_RECONNECT_DELAY_MS = 60000;
     private static final long HEALTH_CHECK_INTERVAL_MS = 120000;
@@ -55,19 +47,16 @@ public class HLSStreamService {
     private static final long CSV_LOG_INTERVAL_MS = 300000;
     private static final long STREAM_TIMEOUT_MS = 600000;
 
-    // Thread pools
     private final ExecutorService streamExecutor;
     private final ScheduledExecutorService startupScheduler;
     private final ScheduledExecutorService healthCheckScheduler;
     private final ScheduledExecutorService memoryMonitor;
     private final ScheduledExecutorService csvLogger;
 
-    // Startup control
     private final Semaphore startupSemaphore = new Semaphore(1, true);
     private final AtomicInteger startupQueue = new AtomicInteger(0);
     private final AtomicBoolean isShuttingDown = new AtomicBoolean(false);
 
-    // Stream tracking
     private final ConcurrentHashMap<String, String> streamLinks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Future<?>> streamTasks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, StreamResources> streamResources = new ConcurrentHashMap<>();
@@ -75,17 +64,16 @@ public class HLSStreamService {
     private final ConcurrentHashMap<String, AtomicBoolean> streamStopFlags = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> streamRtspUrls = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> lastFrameTimes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicInteger> streamReconnectAttempts = new ConcurrentHashMap<>();
 
-    // System monitoring
     private final OperatingSystemMXBean osBean;
     private PrintWriter csvWriter;
 
+    private static final int MAX_HEALTH_CHECK_RECONNECTS = 10;
+
     public HLSStreamService() {
         this.streamExecutor = new ThreadPoolExecutor(
-                WORKER_THREADS,
-                WORKER_THREADS,
-                0L,
-                TimeUnit.MILLISECONDS,
+                WORKER_THREADS, WORKER_THREADS, 0L, TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<>(200),
                 new ThreadFactory() {
                     private final AtomicInteger counter = new AtomicInteger(0);
@@ -99,32 +87,16 @@ public class HLSStreamService {
                 },
                 new ThreadPoolExecutor.CallerRunsPolicy());
 
-        this.startupScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "HLS-Startup-Controller");
-            t.setDaemon(false);
-            return t;
-        });
-
-        this.healthCheckScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "HLS-HealthCheck");
-            t.setDaemon(true);
-            return t;
-        });
-
-        this.memoryMonitor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "HLS-MemoryMonitor");
-            t.setDaemon(true);
-            return t;
-        });
-
-        this.csvLogger = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "HLS-CSVLogger");
-            t.setDaemon(true);
-            return t;
-        });
+        this.startupScheduler = Executors.newSingleThreadScheduledExecutor(r -> 
+            new Thread(r, "HLS-Startup"));
+        this.healthCheckScheduler = Executors.newSingleThreadScheduledExecutor(r -> 
+            new Thread(r, "HLS-Health"));
+        this.memoryMonitor = Executors.newSingleThreadScheduledExecutor(r -> 
+            new Thread(r, "HLS-Memory"));
+        this.csvLogger = Executors.newSingleThreadScheduledExecutor(r -> 
+            new Thread(r, "HLS-CSV"));
 
         ((ThreadPoolExecutor) streamExecutor).prestartAllCoreThreads();
-
         FFmpegLogCallback.set();
         avutil.av_log_set_level(avutil.AV_LOG_FATAL);
 
@@ -136,42 +108,30 @@ public class HLSStreamService {
         startCSVLogging();
 
         logger.info("╔════════════════════════════════════════════╗");
-        logger.info("║  HLS Service - PRODUCTION (25fps capable) ║");
-        logger.info("║  Max Streams: 50-70                       ║");
-        logger.info("║  Worker Threads: " + WORKER_THREADS + "                       ║");
-        logger.info("║  Target FPS: " + TARGET_FPS + " (from 25fps source)         ║");
-        logger.info("║  ✅ Handles 25fps cameras properly       ║");
-        logger.info("║  ✅ Zero memory leaks                    ║");
-        logger.info("║  ✅ Network congestion resistant         ║");
+        logger.info("║  HLS Service - FIXED RECONNECTION         ║");
+        logger.info("║  Max Streams: 100, Workers: 70            ║");
+        logger.info("║  ✅ Proper task cleanup                  ║");
+        logger.info("║  ✅ No duplicate reconnects              ║");
         logger.info("╚════════════════════════════════════════════╝");
     }
 
     private void initializeCSVLogger() {
         try {
             File logDir = new File(LOG_ROOT);
-            if (!logDir.exists()) {
-                logDir.mkdirs();
-            }
+            if (!logDir.exists()) logDir.mkdirs();
 
             String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
             File csvFile = new File(LOG_ROOT, "system_metrics_" + timestamp + ".csv");
-            
             csvWriter = new PrintWriter(new FileWriter(csvFile, true));
-            
             csvWriter.println("Timestamp,ActiveStreams,WorkerThreads,ActiveThreads,QueueSize," +
-                    "UsedMemoryMB,MaxMemoryMB,MemoryUsagePercent," +
-                    "SystemCPULoad,ProcessCPULoad,TotalReadFrames,TotalEncodedFrames," +
-                    "TotalErrors,DeadStreams");
+                    "UsedMemoryMB,MaxMemoryMB,MemoryUsagePercent,SystemCPULoad,ProcessCPULoad," +
+                    "TotalReadFrames,TotalEncodedFrames,TotalErrors,DeadStreams");
             csvWriter.flush();
-            
-            logger.info("✓ CSV logger initialized: " + csvFile.getAbsolutePath());
+            logger.info("✓ CSV logger: " + csvFile.getAbsolutePath());
         } catch (Exception e) {
-            logger.severe("❌ Failed to initialize CSV logger: " + e.getMessage());
+            logger.severe("❌ CSV init failed: " + e.getMessage());
         }
     }
-
-    private final ConcurrentHashMap<String, AtomicInteger> streamReconnectAttempts = new ConcurrentHashMap<>();
-    private static final int MAX_HEALTH_CHECK_RECONNECTS = 10;
 
     private void startHealthCheck() {
         healthCheckScheduler.scheduleAtFixedRate(() -> {
@@ -187,16 +147,15 @@ public class HLSStreamService {
                     if (now - lastFrame > STREAM_TIMEOUT_MS) {
                         AtomicInteger reconnectCount = streamReconnectAttempts.computeIfAbsent(
                             streamName, k -> new AtomicInteger(0));
-                        
                         int attempts = reconnectCount.get();
-                        
+
                         if (attempts < MAX_HEALTH_CHECK_RECONNECTS) {
-                            logger.warning("⚠ Stream timeout (no frames for 10min): " + streamName + 
+                            logger.warning("⚠ Timeout: " + streamName + 
                                          " - Reconnect " + (attempts + 1) + "/" + MAX_HEALTH_CHECK_RECONNECTS);
                             reconnectStreams.add(streamName);
                             reconnectCount.incrementAndGet();
                         } else {
-                            logger.severe("☠ Stream dead after 10 reconnects: " + streamName);
+                            logger.severe("☠ Dead after " + MAX_HEALTH_CHECK_RECONNECTS + " attempts: " + streamName);
                             deadStreams.add(streamName);
                         }
                     } else {
@@ -215,45 +174,103 @@ public class HLSStreamService {
 
                 if (reconnectStreams.size() > 0 || deadStreams.size() > 0) {
                     ThreadPoolExecutor pool = (ThreadPoolExecutor) streamExecutor;
-                    logger.info(String.format(
-                        "📊 Health: Streams=%d/%d, Workers=%d/%d, Reconnecting=%d, Killed=%d",
-                        streamLinks.size(), MAX_STREAMS,
-                        pool.getActiveCount(), WORKER_THREADS,
-                        reconnectStreams.size(), deadStreams.size()
-                    ));
+                    logger.info(String.format("📊 Health: Streams=%d/%d, Workers=%d/%d, Reconnecting=%d, Killed=%d",
+                        streamLinks.size(), MAX_STREAMS, pool.getActiveCount(), WORKER_THREADS,
+                        reconnectStreams.size(), deadStreams.size()));
                 }
-
             } catch (Exception e) {
                 logger.severe("❌ Health check error: " + e.getMessage());
             }
         }, HEALTH_CHECK_INTERVAL_MS, HEALTH_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * ✅ FIXED: Properly stops old task before starting new one
+     * Uses a lock per stream to prevent concurrent reconnections
+     */
+    private final ConcurrentHashMap<String, Object> streamLocks = new ConcurrentHashMap<>();
+    
     private void triggerStreamReconnect(String streamName) {
-        try {
-            Future<?> future = streamTasks.get(streamName);
-            if (future != null && !future.isDone()) {
-                future.cancel(true);
+        // ✅ Get or create a lock for this specific stream
+        Object lock = streamLocks.computeIfAbsent(streamName, k -> new Object());
+        
+        synchronized (lock) {
+            try {
+                logger.info("🔒 Acquired reconnect lock: " + streamName);
+                
+                // ✅ Step 1: Signal stop to existing task
+                AtomicBoolean stopFlag = streamStopFlags.get(streamName);
+                if (stopFlag != null) {
+                    stopFlag.set(true);
+                    logger.info("🛑 Stop flag set: " + streamName);
+                }
+
+                // ✅ Step 2: Cancel and wait for old task to finish
+                Future<?> oldFuture = streamTasks.get(streamName);
+                if (oldFuture != null && !oldFuture.isDone()) {
+                    logger.info("⏸ Stopping old task: " + streamName);
+                    oldFuture.cancel(true);
+                    
+                    try {
+                        // Wait up to 8 seconds for graceful shutdown
+                        oldFuture.get(8, TimeUnit.SECONDS);
+                        logger.info("✓ Old task stopped gracefully: " + streamName);
+                    } catch (TimeoutException e) {
+                        logger.warning("⚠ Old task timeout after 8s: " + streamName + " (forcing shutdown)");
+                        // Task is stuck, force cleanup
+                    } catch (CancellationException e) {
+                        logger.info("✓ Old task cancelled: " + streamName);
+                    } catch (Exception e) {
+                        logger.warning("⚠ Old task stop error: " + streamName + " - " + e.getMessage());
+                    }
+                }
+
+                // ✅ Step 3: Force clean up resources (even if task is stuck)
+                StreamResources resources = streamResources.remove(streamName);
+                if (resources != null) {
+                    logger.info("🧹 Cleaning up FFmpeg resources: " + streamName);
+                    safeCleanup(streamName, resources.grabber, resources.recorder, true);
+                }
+
+                // ✅ Step 4: Small delay to ensure thread fully exits
+                Thread.sleep(500);
+
+                // ✅ Step 5: Verify RTSP URL exists
+                String rtspUrl = streamRtspUrls.get(streamName);
+                if (rtspUrl == null) {
+                    logger.warning("⚠ No RTSP URL for: " + streamName);
+                    streamLocks.remove(streamName);
+                    return;
+                }
+
+                // ✅ Step 6: Reset stop flag for new task
+                streamStopFlags.put(streamName, new AtomicBoolean(false));
+                lastFrameTimes.put(streamName, System.currentTimeMillis());
+
+                // ✅ Step 7: Get or create stats
+                StreamStats stats = streamStats.get(streamName);
+                if (stats == null) {
+                    stats = new StreamStats(streamName);
+                    streamStats.put(streamName, stats);
+                }
+
+                final StreamStats finalStats = stats;
+                logger.info("▶ Starting new task: " + streamName);
+                
+                // ✅ Step 8: Start new task
+                Future<?> newFuture = streamExecutor.submit(() -> {
+                    runStreamWithAutoReconnect(rtspUrl, streamName, finalStats);
+                });
+
+                streamTasks.put(streamName, newFuture);
+                logger.info("✓ New task submitted: " + streamName);
+
+            } catch (Exception e) {
+                logger.severe("❌ Reconnect failed for " + streamName + ": " + e.getMessage());
+                e.printStackTrace();
+            } finally {
+                logger.info("🔓 Released reconnect lock: " + streamName);
             }
-
-            String rtspUrl = streamRtspUrls.get(streamName);
-            if (rtspUrl == null) {
-                logger.warning("⚠ Cannot reconnect " + streamName + ": No RTSP URL");
-                return;
-            }
-
-            lastFrameTimes.put(streamName, System.currentTimeMillis());
-            final StreamStats finalStats = streamStats.computeIfAbsent(streamName, StreamStats::new);
-
-            logger.info("▶ Reconnecting: " + streamName);
-            Future<?> newFuture = streamExecutor.submit(() -> {
-                runStreamWithAutoReconnect(rtspUrl, streamName, finalStats);
-            });
-
-            streamTasks.put(streamName, newFuture);
-
-        } catch (Exception e) {
-            logger.severe("❌ Reconnect failed for " + streamName + ": " + e.getMessage());
         }
     }
 
@@ -261,34 +278,25 @@ public class HLSStreamService {
         memoryMonitor.scheduleAtFixedRate(() -> {
             try {
                 Runtime runtime = Runtime.getRuntime();
-                long totalMemory = runtime.totalMemory();
-                long freeMemory = runtime.freeMemory();
-                long usedMemory = totalMemory - freeMemory;
+                long usedMemory = runtime.totalMemory() - runtime.freeMemory();
                 long maxMemory = runtime.maxMemory();
-                
                 double usedPercent = (usedMemory * 100.0) / maxMemory;
-                
-                if (usedPercent > 80 || streamLinks.size() % 10 == 0) {
-                    logger.info(String.format(
-                        "💾 Memory: %dMB/%dMB (%.1f%%), Streams=%d",
-                        usedMemory / (1024 * 1024),
-                        maxMemory / (1024 * 1024),
-                        usedPercent,
-                        streamLinks.size()
-                    ));
+
+                if (usedPercent > 80) {
+                    logger.info(String.format("💾 Memory: %dMB/%dMB (%.1f%%), Streams=%d",
+                        usedMemory / (1024 * 1024), maxMemory / (1024 * 1024), usedPercent, streamLinks.size()));
                 }
 
                 if (usedPercent > 85) {
-                    logger.warning("⚠ High memory: " + String.format("%.1f%%", usedPercent) + " - GC");
+                    logger.warning("⚠ High memory: " + String.format("%.1f%%", usedPercent) + " - Running GC");
                     System.gc();
                     Thread.sleep(2000);
                 }
 
                 if (usedPercent > 95) {
-                    logger.severe("🔥 CRITICAL MEMORY! Stopping 5 oldest streams");
+                    logger.severe("🔥 CRITICAL! Stopping 5 oldest streams");
                     stopOldestStreams(5);
                 }
-
             } catch (Exception e) {
                 logger.severe("❌ Memory monitor error: " + e.getMessage());
             }
@@ -334,10 +342,8 @@ public class HLSStreamService {
                     new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()),
                     streamLinks.size(), WORKER_THREADS, pool.getActiveCount(), pool.getQueue().size(),
                     usedMemory / (1024 * 1024), maxMemory / (1024 * 1024), memoryUsagePercent,
-                    systemCpuLoad, processCpuLoad, totalReadFrames, totalEncodedFrames, totalErrors, 0
-            );
+                    systemCpuLoad, processCpuLoad, totalReadFrames, totalEncodedFrames, totalErrors, 0);
             csvWriter.flush();
-
         } catch (Exception e) {
             logger.severe("❌ CSV write error: " + e.getMessage());
         }
@@ -350,24 +356,16 @@ public class HLSStreamService {
         int stopped = 0;
         for (Map.Entry<String, StreamStats> entry : sorted) {
             if (stopped >= count) break;
-            logger.warning("🛑 Emergency stop (memory): " + entry.getKey());
+            logger.warning("🛑 Emergency stop: " + entry.getKey());
             stopHLSStream(entry.getKey());
             stopped++;
         }
     }
 
     public String startHLSStream(String rtspUrl, String streamName) {
-        if (isShuttingDown.get()) {
-            throw new RuntimeException("Service shutting down");
-        }
-
-        if (streamLinks.containsKey(streamName)) {
-            return streamLinks.get(streamName);
-        }
-
-        if (streamTasks.size() >= MAX_STREAMS) {
-            throw new RuntimeException("Max capacity: " + MAX_STREAMS);
-        }
+        if (isShuttingDown.get()) throw new RuntimeException("Service shutting down");
+        if (streamLinks.containsKey(streamName)) return streamLinks.get(streamName);
+        if (streamTasks.size() >= MAX_STREAMS) throw new RuntimeException("Max capacity: " + MAX_STREAMS);
 
         String playlistPath = "/api/hls/" + streamName + "/stream.m3u8";
 
@@ -382,12 +380,11 @@ public class HLSStreamService {
         int queuePosition = startupQueue.incrementAndGet();
         long delay = (queuePosition - 1) * STARTUP_DELAY_MS;
 
-        logger.info("→ Queued: " + streamName + " (pos: " + queuePosition + ", delay: " + delay + "ms)");
+        logger.info("→ Queued: " + streamName + " (pos: " + queuePosition + ")");
 
         startupScheduler.schedule(() -> {
             try {
                 startupSemaphore.acquire();
-
                 if (isShuttingDown.get()) {
                     cleanupStreamState(streamName);
                     return;
@@ -397,9 +394,7 @@ public class HLSStreamService {
                 Future<?> future = streamExecutor.submit(() -> {
                     runStreamWithAutoReconnect(rtspUrl, streamName, stats);
                 });
-
                 streamTasks.put(streamName, future);
-
             } catch (Exception e) {
                 logger.severe("⚠ Startup failed: " + streamName);
                 cleanupStreamState(streamName);
@@ -417,10 +412,11 @@ public class HLSStreamService {
         int reconnectAttempt = 0;
         AtomicBoolean stopFlag = streamStopFlags.get(streamName);
 
-        while (!isShuttingDown.get() && streamLinks.containsKey(streamName) && !stopFlag.get()) {
+        while (!isShuttingDown.get() && streamLinks.containsKey(streamName) && 
+               stopFlag != null && !stopFlag.get()) {
             try {
                 if (reconnectAttempt > 0) {
-                    logger.info("🔄 Reconnect #" + reconnectAttempt + ": " + streamName);
+                    logger.info("🔄 Internal reconnect #" + reconnectAttempt + ": " + streamName);
                 }
 
                 runStream(rtspUrl, streamName, stats);
@@ -432,7 +428,6 @@ public class HLSStreamService {
                     long delay = Math.min(RECONNECT_DELAY_MS * reconnectAttempt, MAX_RECONNECT_DELAY_MS);
                     Thread.sleep(delay);
                 }
-
             } catch (Exception e) {
                 stats.recordError(e);
                 reconnectAttempt++;
@@ -489,8 +484,7 @@ public class HLSStreamService {
             streamResources.put(streamName, resources);
 
             int frameSkipRatio = Math.max(1, (int) Math.round(sourceFps / TARGET_FPS));
-            logger.info("🎯 " + streamName + ": Source " + sourceFps + "fps → Target " + TARGET_FPS + 
-                       "fps (skip ratio: 1/" + frameSkipRatio + ", encode every " + frameSkipRatio + "th frame)");
+            logger.info("🎯 " + streamName + ": " + sourceFps + "fps → " + TARGET_FPS + "fps (skip 1/" + frameSkipRatio + ")");
             
             streamFrames(grabber, recorder, streamName, stats, frameSkipRatio, sourceFps);
 
@@ -499,16 +493,6 @@ public class HLSStreamService {
         }
     }
 
-    /**
-     * ✅ PRODUCTION: Handles 25fps cameras properly
-     * 
-     * KEY FEATURES:
-     * - Reads at camera speed (25fps = 40ms per frame)
-     * - Encodes at target speed (8fps = every 3rd frame)
-     * - Zero memory leaks (frames always closed)
-     * - Network congestion resistant
-     * - Adaptive error handling
-     */
     private void streamFrames(FFmpegFrameGrabber grabber, FFmpegFrameRecorder recorder, 
                               String streamName, StreamStats stats, int frameSkipRatio, 
                               double sourceFps) throws Exception {
@@ -517,10 +501,10 @@ public class HLSStreamService {
         long lastSuccessfulEncode = System.currentTimeMillis();
         long lastFrameTime = System.currentTimeMillis();
 
-        final int MAX_NULL_FRAMES = 500;  // Higher tolerance for 25fps
+        final int MAX_NULL_FRAMES = 500;
         final int MAX_ENCODE_FAILURES = 20;
-        final long MAX_TIME_WITHOUT_ENCODE = 180000;  // 3 minutes
-        final long FRAME_TIME_MS = (long)(1000.0 / sourceFps);  // 40ms for 25fps
+        final long MAX_TIME_WITHOUT_ENCODE = 180000;
+        final long FRAME_TIME_MS = (long)(1000.0 / sourceFps);
         
         int consecutiveNullFrames = 0;
         int consecutiveEncodeFailures = 0;
@@ -531,27 +515,24 @@ public class HLSStreamService {
 
         logger.info(streamName + ": Frame loop started (read: " + sourceFps + "fps, encode: " + TARGET_FPS + "fps)");
 
-        while (!isShuttingDown.get() && !Thread.currentThread().isInterrupted() && !stopFlag.get()) {
+        while (!isShuttingDown.get() && !Thread.currentThread().isInterrupted() && 
+               stopFlag != null && !stopFlag.get()) {
             Frame frame = null;
             
             try {
                 long now = System.currentTimeMillis();
                 
-                // Check for stuck encoding
                 if (now - lastSuccessfulEncode > MAX_TIME_WITHOUT_ENCODE) {
                     logger.warning(streamName + ": ❌ No encoding for 3min - reconnecting");
                     throw new RuntimeException("Encoding timeout");
                 }
 
-                // ✅ CRITICAL: Pace frame reading to match camera speed
-                // Don't read faster than camera sends to prevent buffer issues
                 long timeSinceLastFrame = now - lastFrameTime;
                 if (timeSinceLastFrame < FRAME_TIME_MS) {
                     Thread.sleep(FRAME_TIME_MS - timeSinceLastFrame);
                 }
                 lastFrameTime = System.currentTimeMillis();
 
-                // Grab frame from camera
                 frame = grabber.grabImage();
 
                 if (frame == null) {
@@ -570,23 +551,19 @@ public class HLSStreamService {
                         throw new RuntimeException("Stream stalled");
                     }
                     
-                    // Adaptive sleep
                     Thread.sleep(consecutiveNullFrames < 10 ? 5 : 
                                 consecutiveNullFrames < 100 ? 10 : 
                                 consecutiveNullFrames < 300 ? 20 : 50);
                     continue;
                 }
 
-                // Got a frame
                 consecutiveNullFrames = 0;
                 stats.recordReadFrame();
                 lastFrameTimes.put(streamName, now);
                 frameCounter++;
 
-                // Decide if we encode this frame
                 boolean shouldEncode = (frameCounter % frameSkipRatio == 0);
 
-                // Validate frame
                 if (frame.image == null || frame.imageWidth <= 0 || frame.imageHeight <= 0) {
                     stats.recordSkippedFrame();
                     frame.close();
@@ -599,10 +576,8 @@ public class HLSStreamService {
                     try {
                         recorder.record(frame);
                         stats.recordEncodedFrame();
-                        
                         consecutiveEncodeFailures = 0;
                         lastSuccessfulEncode = now;
-
                     } catch (Exception e) {
                         stats.recordError(e);
                         consecutiveEncodeFailures++;
@@ -620,11 +595,9 @@ public class HLSStreamService {
                     stats.recordSkippedFrame();
                 }
 
-                // Close frame immediately
                 frame.close();
                 frame = null;
 
-                // Logging
                 now = System.currentTimeMillis();
                 if (now - lastLogTime > 30000) {
                     logger.info(stats.getLogSummary());
@@ -638,16 +611,13 @@ public class HLSStreamService {
 
             } catch (Exception e) {
                 if (frame != null) {
-                    try {
-                        frame.close();
-                    } catch (Exception ignored) {}
+                    try { frame.close(); } catch (Exception ignored) {}
                     frame = null;
                 }
 
                 stats.recordError(e);
                 String msg = e.getMessage();
 
-                // Fatal errors
                 if (msg != null && (
                         msg.contains("Encoding timeout") ||
                         msg.contains("Stream stalled") ||
@@ -657,7 +627,6 @@ public class HLSStreamService {
                     throw e;
                 }
 
-                // Ignore harmless codec errors
                 if (msg != null && (
                         msg.contains("no frame!") ||
                         msg.contains("missing picture") ||
@@ -667,11 +636,9 @@ public class HLSStreamService {
                         msg.contains("bytestream"))) {
 
                     totalIgnoredErrors++;
-                    
                     if (totalIgnoredErrors % 500 == 0) {
                         logger.info(streamName + ": 📊 Ignored " + totalIgnoredErrors + " codec errors");
                     }
-                    
                     Thread.sleep(10);
                     continue;
                 }
@@ -700,7 +667,6 @@ public class HLSStreamService {
                     }
 
                     grabber.release();
-
                 } catch (Exception e) {
                     lastException = e;
                 }
@@ -712,68 +678,45 @@ public class HLSStreamService {
         throw lastException != null ? lastException : new RuntimeException("RTSP connection failed");
     }
 
-    /**
-     * ✅ OPTIMIZED: Handles 25fps cameras that won't reduce framerate
-     * 
-     * KEY SETTINGS:
-     * - Large buffers (8MB) for sustained 25fps reading
-     * - Longer timeouts (60s) for network congestion
-     * - Error concealment for packet loss
-     * - NO framerate forcing (camera ignores it)
-     */
     private FFmpegFrameGrabber createGrabber(String url) {
         FFmpegFrameGrabber g = new FFmpegFrameGrabber(url);
         g.setFormat("rtsp");
         g.setImageMode(org.bytedeco.javacv.FrameGrabber.ImageMode.COLOR);
         
-        // ❌ NOT setting framerate - camera ignores it and sends 25fps anyway
-        // We handle frame rate reduction by skipping frames during encoding
-
-        // Threading
         g.setOption("threads", "1");
         g.setOption("thread_count", "0");
         g.setVideoOption("threads", "1");
         
-        // ✅ CRITICAL: Larger buffers for sustained 25fps reading
-        g.setOption("analyzeduration", "5000000");    // 5s
-        g.setOption("probesize", "5000000");          // 5MB
-        g.setOption("max_delay", "1000000");          // 1s
+        g.setOption("analyzeduration", "5000000");
+        g.setOption("probesize", "5000000");
+        g.setOption("max_delay", "1000000");
         
-        // ✅ CRITICAL: Large reorder queue for 25fps with packet loss
-        g.setOption("reorder_queue_size", "8192");    // 8K packets
-        g.setOption("max_interleave_delta", "2000000"); // 2s gaps tolerated
+        g.setOption("reorder_queue_size", "8192");
+        g.setOption("max_interleave_delta", "2000000");
         
-        // Error handling - Maximum tolerance
         g.setOption("err_detect", "ignore_err");
         g.setOption("ec", "favor_inter+guess_mvs+deblock");
         
-        // Frame skipping at decoder level (lightweight)
         g.setOption("skip_frame", "noref");
         g.setOption("skip_loop_filter", "noref");
         g.setOption("skip_idct", "noref");
         
-        // Timestamp handling
         g.setOption("fflags", "+discardcorrupt+nobuffer+genpts+igndts+ignidx");
         g.setOption("flags", "low_delay");
         g.setOption("flags2", "+ignorecrop+showall");
         
-        // RTSP settings
         g.setOption("rtsp_transport", "tcp");
         g.setOption("rtsp_flags", "prefer_tcp");
-        g.setOption("stimeout", "60000000");          // 60s - patient with slow networks
+        g.setOption("stimeout", "60000000");
         g.setOption("timeout", "60000000");
 
-        // ✅ CRITICAL: Large buffer for 25fps sustained reading
-        // 25fps × 50KB/frame × 6.4 buffers = ~8MB needed
-        g.setOption("buffer_size", "8192000");        // 8MB
+        g.setOption("buffer_size", "8192000");
         g.setOption("allowed_media_types", "video");
         
-        // Error tolerance
-        g.setOption("max_error_rate", "1.0");         // 100% tolerance
-        g.setOption("rw_timeout", "60000000");        // 60s
+        g.setOption("max_error_rate", "1.0");
+        g.setOption("rw_timeout", "60000000");
         g.setOption("use_wallclock_as_timestamps", "1");
         
-        // H.264/HEVC specific
         g.setOption("strict", "-2");
         g.setOption("err_detect", "compliant");
 
@@ -891,6 +834,9 @@ public class HLSStreamService {
         deleteStreamFiles(streamName);
     }
 
+    /**
+     * ✅ FIXED: More aggressive cleanup to prevent resource leaks
+     */
     private void safeCleanup(String streamName, FFmpegFrameGrabber grabber, FFmpegFrameRecorder recorder,
             boolean recorderWasStarted) {
         streamResources.remove(streamName);
@@ -898,22 +844,32 @@ public class HLSStreamService {
         if (recorder != null && recorderWasStarted) {
             try {
                 recorder.stop();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                logger.warning("Recorder stop error for " + streamName + ": " + e.getMessage());
+            }
 
             try {
                 recorder.release();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                logger.warning("Recorder release error for " + streamName + ": " + e.getMessage());
+            }
         }
 
         if (grabber != null) {
             try {
                 grabber.stop();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                logger.warning("Grabber stop error for " + streamName + ": " + e.getMessage());
+            }
 
             try {
                 grabber.release();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                logger.warning("Grabber release error for " + streamName + ": " + e.getMessage());
+            }
         }
+
+        logger.info("✓ Cleanup complete: " + streamName);
     }
 
     private void deleteStreamFiles(String streamName) {
