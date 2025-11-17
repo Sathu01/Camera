@@ -408,11 +408,16 @@ public class HLSStreamService {
         return playlistPath;
     }
 
+    /**
+     * ✅ FIXED: Check thread interruption more frequently
+     */
     private void runStreamWithAutoReconnect(String rtspUrl, String streamName, StreamStats stats) {
         int reconnectAttempt = 0;
         AtomicBoolean stopFlag = streamStopFlags.get(streamName);
 
-        while (!isShuttingDown.get() && streamLinks.containsKey(streamName) && 
+        while (!isShuttingDown.get() && 
+               !Thread.currentThread().isInterrupted() &&  // ✅ Check interruption
+               streamLinks.containsKey(streamName) && 
                stopFlag != null && !stopFlag.get()) {
             try {
                 if (reconnectAttempt > 0) {
@@ -421,22 +426,32 @@ public class HLSStreamService {
 
                 runStream(rtspUrl, streamName, stats);
 
-                if (stopFlag.get()) break;
+                // ✅ Check if we should stop after stream ends
+                if (stopFlag.get() || Thread.currentThread().isInterrupted()) {
+                    logger.info("🛑 Stop requested after stream ended: " + streamName);
+                    break;
+                }
 
                 reconnectAttempt++;
-                if (!stopFlag.get()) {
+                if (!stopFlag.get() && !Thread.currentThread().isInterrupted()) {
                     long delay = Math.min(RECONNECT_DELAY_MS * reconnectAttempt, MAX_RECONNECT_DELAY_MS);
+                    logger.info("⏳ Waiting " + (delay/1000) + "s before reconnect #" + (reconnectAttempt+1) + ": " + streamName);
                     Thread.sleep(delay);
                 }
+            } catch (InterruptedException e) {
+                logger.info("⚡ Thread interrupted during reconnect: " + streamName);
+                Thread.currentThread().interrupt();
+                break;
             } catch (Exception e) {
                 stats.recordError(e);
                 reconnectAttempt++;
 
-                if (!stopFlag.get()) {
+                if (!stopFlag.get() && !Thread.currentThread().isInterrupted()) {
                     try {
                         long delay = Math.min(RECONNECT_DELAY_MS * reconnectAttempt, MAX_RECONNECT_DELAY_MS);
                         Thread.sleep(delay);
                     } catch (InterruptedException ie) {
+                        logger.info("⚡ Thread interrupted during error recovery: " + streamName);
                         Thread.currentThread().interrupt();
                         break;
                     }
@@ -444,6 +459,7 @@ public class HLSStreamService {
             }
         }
 
+        logger.info("🏁 Stream task exiting: " + streamName);
         cleanupStreamState(streamName);
     }
 
@@ -493,18 +509,19 @@ public class HLSStreamService {
         }
     }
 
+    /**
+     * ✅ FIXED: Removed artificial frame pacing - let FFmpeg handle timing
+     */
     private void streamFrames(FFmpegFrameGrabber grabber, FFmpegFrameRecorder recorder, 
                               String streamName, StreamStats stats, int frameSkipRatio, 
                               double sourceFps) throws Exception {
         long lastLogTime = System.currentTimeMillis();
         long lastStatsUpdate = System.currentTimeMillis();
         long lastSuccessfulEncode = System.currentTimeMillis();
-        long lastFrameTime = System.currentTimeMillis();
 
         final int MAX_NULL_FRAMES = 500;
         final int MAX_ENCODE_FAILURES = 20;
-        final long MAX_TIME_WITHOUT_ENCODE = 180000;
-        final long FRAME_TIME_MS = (long)(1000.0 / sourceFps);
+        final long MAX_TIME_WITHOUT_ENCODE = 180000;  // 3 minutes
         
         int consecutiveNullFrames = 0;
         int consecutiveEncodeFailures = 0;
@@ -522,28 +539,36 @@ public class HLSStreamService {
             try {
                 long now = System.currentTimeMillis();
                 
+                // Check for encoding timeout
                 if (now - lastSuccessfulEncode > MAX_TIME_WITHOUT_ENCODE) {
                     logger.warning(streamName + ": ❌ No encoding for 3min - reconnecting");
                     throw new RuntimeException("Encoding timeout");
                 }
 
-                long timeSinceLastFrame = now - lastFrameTime;
-                if (timeSinceLastFrame < FRAME_TIME_MS) {
-                    Thread.sleep(FRAME_TIME_MS - timeSinceLastFrame);
-                }
-                lastFrameTime = System.currentTimeMillis();
-
+                // ✅ NO ARTIFICIAL PACING - just grab frames as fast as FFmpeg provides them
                 frame = grabber.grabImage();
 
                 if (frame == null) {
                     consecutiveNullFrames++;
 
-                    if (consecutiveNullFrames == 50) {
-                        logger.warning(streamName + ": ⚠ 50 null frames");
-                    } else if (consecutiveNullFrames == 200) {
-                        logger.warning(streamName + ": ⚠ 200 null frames");
-                    } else if (consecutiveNullFrames == 400) {
-                        logger.warning(streamName + ": ⚠ 400 null frames (will reconnect at 500)");
+                    // ✅ Progressive backoff - longer waits for persistent null frames
+                    long sleepTime;
+                    if (consecutiveNullFrames < 5) {
+                        sleepTime = 100;  // 100ms - camera buffering
+                    } else if (consecutiveNullFrames < 50) {
+                        sleepTime = 200;  // 200ms - network issue
+                    } else if (consecutiveNullFrames < 200) {
+                        sleepTime = 500;  // 500ms - serious problem
+                    } else {
+                        sleepTime = 1000; // 1s - critical
+                    }
+
+                    if (consecutiveNullFrames == 10) {
+                        logger.warning(streamName + ": ⚠ 10 null frames (camera buffering?)");
+                    } else if (consecutiveNullFrames == 100) {
+                        logger.warning(streamName + ": ⚠ 100 null frames (network issue?)");
+                    } else if (consecutiveNullFrames == 300) {
+                        logger.warning(streamName + ": ⚠ 300 null frames (will reconnect at 500)");
                     }
 
                     if (consecutiveNullFrames >= MAX_NULL_FRAMES) {
@@ -551,19 +576,20 @@ public class HLSStreamService {
                         throw new RuntimeException("Stream stalled");
                     }
                     
-                    Thread.sleep(consecutiveNullFrames < 10 ? 5 : 
-                                consecutiveNullFrames < 100 ? 10 : 
-                                consecutiveNullFrames < 300 ? 20 : 50);
+                    Thread.sleep(sleepTime);
                     continue;
                 }
 
+                // Got a valid frame
                 consecutiveNullFrames = 0;
                 stats.recordReadFrame();
                 lastFrameTimes.put(streamName, now);
                 frameCounter++;
 
+                // Decide if we encode this frame (frame skipping for FPS reduction)
                 boolean shouldEncode = (frameCounter % frameSkipRatio == 0);
 
+                // Validate frame
                 if (frame.image == null || frame.imageWidth <= 0 || frame.imageHeight <= 0) {
                     stats.recordSkippedFrame();
                     frame.close();
@@ -595,9 +621,11 @@ public class HLSStreamService {
                     stats.recordSkippedFrame();
                 }
 
+                // ✅ ALWAYS close frames immediately
                 frame.close();
                 frame = null;
 
+                // Logging
                 now = System.currentTimeMillis();
                 if (now - lastLogTime > 30000) {
                     logger.info(stats.getLogSummary());
@@ -618,6 +646,7 @@ public class HLSStreamService {
                 stats.recordError(e);
                 String msg = e.getMessage();
 
+                // Fatal errors - reconnect
                 if (msg != null && (
                         msg.contains("Encoding timeout") ||
                         msg.contains("Stream stalled") ||
@@ -627,17 +656,19 @@ public class HLSStreamService {
                     throw e;
                 }
 
+                // Ignore harmless codec errors
                 if (msg != null && (
                         msg.contains("no frame!") ||
                         msg.contains("missing picture") ||
                         msg.contains("Could not find ref") ||
                         msg.contains("error while decoding MB") ||
                         msg.contains("corrupted frame") ||
-                        msg.contains("bytestream"))) {
+                        msg.contains("bytestream") ||
+                        msg.contains("concealing"))) {
 
                     totalIgnoredErrors++;
-                    if (totalIgnoredErrors % 500 == 0) {
-                        logger.info(streamName + ": 📊 Ignored " + totalIgnoredErrors + " codec errors");
+                    if (totalIgnoredErrors % 1000 == 0) {
+                        logger.info(streamName + ": 📊 Ignored " + totalIgnoredErrors + " codec errors (normal)");
                     }
                     Thread.sleep(10);
                     continue;
@@ -815,6 +846,8 @@ public class HLSStreamService {
     }
 
     private void cleanupStreamState(String streamName) {
+        logger.info("🧹 Starting cleanup for: " + streamName);
+        
         streamLinks.remove(streamName);
         streamRtspUrls.remove(streamName);
         streamStopFlags.remove(streamName);
@@ -823,6 +856,7 @@ public class HLSStreamService {
 
         StreamResources resources = streamResources.remove(streamName);
         if (resources != null) {
+            logger.info("🔧 Releasing FFmpeg resources: " + streamName);
             safeCleanup(streamName, resources.grabber, resources.recorder, true);
         }
 
@@ -832,6 +866,11 @@ public class HLSStreamService {
         }
 
         deleteStreamFiles(streamName);
+        
+        // ✅ Remove lock after everything is cleaned up
+        streamLocks.remove(streamName);
+        
+        logger.info("✅ Cleanup complete for: " + streamName);
     }
 
     /**
